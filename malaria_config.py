@@ -1,31 +1,3 @@
-"""
-Mask R-CNN
-Based on the toy Balloon dataset and implement color splash effect, for malaria detection.
-
-Copyright (c) 2018 Matterport, Inc.
-Licensed under the MIT License (see LICENSE for details)
-Originally Written by Waleed Abdulla
-
-------------------------------------------------------------
-
-Usage: import the module (see Jupyter notebooks for examples), or run from
-       the command line as such:
-
-    # Train a new model starting from pre-trained COCO weights
-    python3 malaria.py train --dataset=/path/to/malaria/dataset --weights=coco
-
-    # Resume training a model that you had trained earlier
-    python3 malaria.py train --dataset=/path/to/malaria/dataset --weights=last
-
-    # Train a new model starting from ImageNet weights
-    python3 malaria.py train --dataset=/path/to/malaria/dataset --weights=imagenet
-
-    # Apply color splash to an image
-    python3 malaria.py splash --weights=/path/to/weights/file.h5 --image=<URL or path to file>
-
-    # Apply color splash to video using the last weights you trained
-    python3 malaria.py splash --weights=last --video=<URL or path to file>
-"""
 import os
 import sys
 import json
@@ -37,62 +9,106 @@ import skimage.io
 import skimage.color
 import matplotlib.pyplot as plt
 
-# Root directory of the project
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Compatibility imports
+from tensorflow.keras import layers
+from tensorflow.keras import models
+from tensorflow.keras.optimizers import Adam
 
-# Import Mask RCNN
-sys.path.append(ROOT_DIR)
-from mrcnn.config import Config
-from mrcnn import model as modellib, utils
+# Updated import for Mask R-CNN (assuming you've installed the right version)
+try:
+    import mrcnn
+    from mrcnn.config import Config
+    from mrcnn import model as modellib
+    from mrcnn import utils
+except ImportError:
+    print("Mask R-CNN library not found. Please install from GitHub.")
+    sys.exit(1)
 
-# Path to COCO weights
-COCO_WEIGHTS_PATH = os.path.join(ROOT_DIR, "mask_rcnn_coco.h5")
+# Configuration for Google Colab
+# Ensure you have the right GPU setup
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
-# Directory for logs and checkpoints
-DEFAULT_LOGS_DIR = os.path.join(ROOT_DIR, "logs")
-
-# Check TensorFlow version
-if not tf.__version__.startswith('2'):
-    raise ImportError("TensorFlow 2.x is required. Found: {}".format(tf.__version__))
-
-############################################################
-#  Configurations
-############################################################
-
+# Validate TensorFlow version
+assert tf.__version__.startswith('2'), "TensorFlow 2.x is required"
 
 class MalariaConfig(Config):
     """Configuration for training on the malaria dataset."""
     NAME = "malaria"
-    IMAGES_PER_GPU = 2
-    NUM_CLASSES = 1 + 4  # Background + classes
+    
+    # GPU config for Colab
+    GPU_COUNT = 1
+    IMAGES_PER_GPU = 2  # Adjust based on your GPU memory
+    
+    # Model hyperparameters
+    NUM_CLASSES = 1 + 4  # Background + cell types
     STEPS_PER_EPOCH = 100
-    DETECTION_MIN_CONFIDENCE = 0.9
-############################################################
-#  Dataset
-############################################################
+    VALIDATION_STEPS = 50
+    
+    # Improved detection parameters
+    DETECTION_MIN_CONFIDENCE = 0.85
+    DETECTION_NMS_THRESHOLD = 0.3
+    
+    # Image processing
+    IMAGE_MIN_DIM = 512
+    IMAGE_MAX_DIM = 1024
+    IMAGE_RESIZE_MODE = "pad64"
+    
+    # Training hyperparameters
+    LEARNING_RATE = 0.001
+    LEARNING_MOMENTUM = 0.9
+    WEIGHT_DECAY = 0.0001
+    
+    # Augmentation
+    ROTATION_RANGE = 45
+    ZOOM_RANGE = [0.8, 1.2]
+
 class CellDataset(utils.Dataset):
-    """Dataset for malaria cell detection."""
+    """Dataset for malaria cell detection with enhanced loading."""
     def load_cell(self, dataset_dir, subset):
-        """Load a subset of the dataset."""
+        """Load dataset with robust error handling."""
         self.add_class("cell", 1, "uninfectedretic")
         self.add_class("cell", 2, "ring")
         self.add_class("cell", 3, "trophozoite")
         self.add_class("cell", 4, "schizont")
 
-        assert subset in ["train", "val"]
-        dataset_dir = os.path.join(dataset_dir, subset)
+        assert subset in ["train", "val"], "Subset must be 'train' or 'val'"
+        
+        # Enhanced path handling
+        dataset_path = os.path.join(dataset_dir, subset)
+        
+        # Robust JSON loading with error handling
+        try:
+            with open(os.path.join(dataset_path, "via_region_data.json"), 'r') as f:
+                annotations = json.load(f)
+        except (IOError, json.JSONDecodeError) as e:
+            print(f"Error loading annotations: {e}")
+            return
 
-        annotations = json.load(open(os.path.join(dataset_dir, "via_region_data.json")))
-        annotations = [a for a in annotations.values() if a['regions']]
+        # Filter annotations with regions
+        annotations = [a for a in annotations.values() if a.get('regions')]
 
         for a in annotations:
-            polygons = [r['shape_attributes'] for r in a['regions'].values()]
-            objects = [s['region_attributes'] for s in a['regions'].values()]
-            num_ids = [int(n['cell']) for n in objects]
+            # Safety checks
+            if not a.get('filename') or not os.path.exists(os.path.join(dataset_path, a['filename'])):
+                continue
 
-            image_path = os.path.join(dataset_dir, a['filename'])
-            image = skimage.io.imread(image_path)
-            height, width = image.shape[:2]
+            # Extract polygon and object information
+            polygons = [r['shape_attributes'] for r in a.get('regions', {}).values()]
+            objects = [s.get('region_attributes', {}) for s in a.get('regions', {}).values()]
+            
+            # Safely extract cell types
+            num_ids = [int(n.get('cell', 0)) for n in objects if n.get('cell')]
+
+            # Image loading with error handling
+            try:
+                image_path = os.path.join(dataset_path, a['filename'])
+                image = skimage.io.imread(image_path)
+                height, width = image.shape[:2]
+            except Exception as e:
+                print(f"Error processing image {a['filename']}: {e}")
+                continue
 
             self.add_image(
                 "cell",
@@ -104,30 +120,30 @@ class CellDataset(utils.Dataset):
                 num_ids=num_ids)
 
     def load_mask(self, image_id):
-        """Generate instance masks for an image."""
+        """Generate instance masks with improved handling."""
         image_info = self.image_info[image_id]
         if image_info["source"] != "cell":
             return super(self.__class__, self).load_mask(image_id)
+        
         num_ids = image_info['num_ids']
-
         info = self.image_info[image_id]
+        
+        # Create mask with safe dimensions
         mask = np.zeros([info["height"], info["width"], len(info["polygons"])], dtype=np.uint8)
+        
         for i, p in enumerate(info["polygons"]):
-            rr, cc = skimage.draw.polygon(p['all_points_y'], p['all_points_x'])
+            # Ensure polygon points are within image boundaries
+            y = np.clip(p['all_points_y'], 0, info["height"] - 1)
+            x = np.clip(p['all_points_x'], 0, info["width"] - 1)
+            
+            rr, cc = skimage.draw.polygon(y, x)
             mask[rr, cc, i] = 1
 
         return mask, np.array(num_ids, dtype=np.int32)
 
-    def image_reference(self, image_id):
-        """Return the path of the image."""
-        info = self.image_info[image_id]
-        if info["source"] == "cell":
-            return info["path"]
-        else:
-            return super(self.__class__, self).image_reference(image_id)
-
-def train(model, dataset_dir, subset):
-    """Train the model."""
+def train(model, dataset_dir, config):
+    """Enhanced training function with more logging and checkpointing."""
+    # Prepare datasets
     dataset_train = CellDataset()
     dataset_train.load_cell(dataset_dir, "train")
     dataset_train.prepare()
@@ -136,181 +152,98 @@ def train(model, dataset_dir, subset):
     dataset_val.load_cell(dataset_dir, "val")
     dataset_val.prepare()
 
+    # Callbacks for better training
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath='malaria_best_model.h5', 
+            save_best_only=True, 
+            monitor='val_loss'
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            patience=10, 
+            monitor='val_loss'
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss', 
+            factor=0.1, 
+            patience=5
+        )
+    ]
+
+    # Train
     print("Training network heads")
-    model.train(dataset_train, dataset_val,
-                learning_rate=config.LEARNING_RATE,
-                epochs=30,
-                layers='heads')
+    model.train(
+        dataset_train, 
+        dataset_val,
+        learning_rate=config.LEARNING_RATE,
+        epochs=50,  # Increased epochs
+        layers='heads',
+        custom_callbacks=callbacks
+    )
 
 def color_splash(image, mask):
-    """Apply color splash effect.
-    image: RGB image [height, width, 3]
-    mask: instance segmentation mask [height, width, instance count]
-
-    Returns result image.
-    """
-    # Make a grayscale copy of the image. The grayscale copy still
-    # has 3 RGB channels, though.
+    """Apply color splash effect with more robust handling."""
+    # Ensure image is in correct format
+    if image.dtype != np.uint8:
+        image = (image * 255).astype(np.uint8)
+    
+    # Convert to grayscale
     gray = skimage.color.gray2rgb(skimage.color.rgb2gray(image)) * 255
-    # Copy color pixels from the original color image where mask is set
-    if mask.shape[-1] > 0:
-        # We're treating all instances as one, so collapse the mask into one layer
+    
+    # Handle mask
+    if mask is not None and mask.shape[-1] > 0:
         mask = (np.sum(mask, -1, keepdims=True) >= 1)
         splash = np.where(mask, image, gray).astype(np.uint8)
     else:
         splash = gray.astype(np.uint8)
+    
     return splash
 
-
-def detect_and_color_splash(model, image_path=None, video_path=None):
-    assert image_path or video_path
-
-    # Image or video?
-    if image_path:
-        # Run model detection and generate the color splash effect
-        print("Running on {}".format(args.image))
-        # Read image
-        image = skimage.io.imread(args.image)
-        # Detect objects
-        r = model.detect([image], verbose=1)[0]
-        # Color splash
-        splash = color_splash(image, r['masks'])
-        # Save output
-        file_name = "splash_{:%Y%m%dT%H%M%S}.png".format(datetime.datetime.now())
-        skimage.io.imsave(file_name, splash)
-    elif video_path:
-        import cv2
-        # Video capture
-        vcapture = cv2.VideoCapture(video_path)
-        width = int(vcapture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(vcapture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = vcapture.get(cv2.CAP_PROP_FPS)
-
-        # Define codec and create video writer
-        file_name = "splash_{:%Y%m%dT%H%M%S}.avi".format(datetime.datetime.now())
-        vwriter = cv2.VideoWriter(file_name,
-                                  cv2.VideoWriter_fourcc(*'MJPG'),
-                                  fps, (width, height))
-
-        count = 0
-        success = True
-        while success:
-            print("frame: ", count)
-            # Read next image
-            success, image = vcapture.read()
-            if success:
-                # OpenCV returns images as BGR, convert to RGB
-                image = image[..., ::-1]
-                # Detect objects
-                r = model.detect([image], verbose=0)[0]
-                # Color splash
-                splash = color_splash(image, r['masks'])
-                # RGB -> BGR to save image to video
-                splash = splash[..., ::-1]
-                # Add image to video writer
-                vwriter.write(splash)
-                count += 1
-        vwriter.release()
-    print("Saved to ", file_name)
-
-
-############################################################
-#  Training
-############################################################
-
-if __name__ == '__main__':
+def main():
+    """Main execution function with argument parsing."""
     import argparse
-
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(
-        description='Train Mask R-CNN to detect cells.')
-    parser.add_argument("command",
-                        metavar="<command>",
-                        help="'train' or 'splash'")
-    parser.add_argument('--dataset', required=False,
-                        metavar="/path/to/malaria/dataset/",
-                        help='Directory of the malaria dataset')
-    parser.add_argument('--weights', required=True,
-                        metavar="/path/to/weights.h5",
-                        help="Path to weights .h5 file or 'coco'")
-    parser.add_argument('--logs', required=False,
-                        default=DEFAULT_LOGS_DIR,
-                        metavar="/path/to/logs/",
-                        help='Logs and checkpoints directory (default=logs/)')
-    parser.add_argument('--image', required=False,
-                        metavar="path or URL to image",
-                        help='Image to apply the color splash effect on')
-    parser.add_argument('--video', required=False,
-                        metavar="path or URL to video",
-                        help='Video to apply the color splash effect on')
+    
+    parser = argparse.ArgumentParser(description='Malaria Cell Detection with Mask R-CNN')
+    parser.add_argument('--mode', required=True, choices=['train', 'detect'],
+                        help='Mode of operation: train or detect')
+    parser.add_argument('--dataset', required=True,
+                        help='Path to malaria dataset')
+    parser.add_argument('--weights', default='coco',
+                        help='Path to weights: coco, last, or specific .h5 file')
+    parser.add_argument('--image', help='Path to image for detection')
+    
     args = parser.parse_args()
 
-    # Validate arguments
-    if args.command == "train":
-        assert args.dataset, "Argument --dataset is required for training"
-    elif args.command == "splash":
-        assert args.image or args.video,\
-               "Provide --image or --video to apply color splash"
-
-    print("Weights: ", args.weights)
-    print("Dataset: ", args.dataset)
-    print("Logs: ", args.logs)
-
-    # Configurations
-    if args.command == "train":
-        config = MalariaConfig()
-    else:
-        class InferenceConfig(MalariaConfig):
-            # Set batch size to 1 since we'll be running inference on
-            # one image at a time. Batch size = GPU_COUNT * IMAGES_PER_GPU
-            GPU_COUNT = 1
-            IMAGES_PER_GPU = 1
-        config = InferenceConfig()
+    # Configuration
+    config = MalariaConfig()
     config.display()
 
-    # Create model
-    if args.command == "train":
-        model = modellib.MaskRCNN(mode="training", config=config,
-                                  model_dir=args.logs)
-    else:
-        model = modellib.MaskRCNN(mode="inference", config=config,
-                                  model_dir=args.logs)
+    # Model initialization
+    model = modellib.MaskRCNN(
+        mode="training" if args.mode == 'train' else "inference", 
+        config=config,
+        model_dir='./logs'
+    )
 
-    # Select weights file to load
-    if args.weights.lower() == "coco":
-        weights_path = COCO_WEIGHTS_PATH
-        # Download weights file
-        if not os.path.exists(weights_path):
-            utils.download_trained_weights(weights_path)
-    elif args.weights.lower() == "last":
-        # Find last trained weights
-        weights_path = model.find_last()
-    elif args.weights.lower() == "imagenet":
-        # Start from ImageNet trained weights
-        weights_path = model.get_imagenet_weights()
+    # Weight loading strategy
+    if args.weights.lower() == 'coco':
+        model.load_weights(COCO_WEIGHTS_PATH, by_name=True,
+                           exclude=["mrcnn_class_logits", "mrcnn_bbox_fc", 
+                                    "mrcnn_bbox", "mrcnn_mask"])
+    elif args.weights.lower() == 'last':
+        model.load_weights(model.find_last(), by_name=True)
     else:
-        weights_path = args.weights
+        model.load_weights(args.weights, by_name=True)
 
-    # Load weights
-    print("Loading weights ", weights_path)
-    if args.weights.lower() == "coco":
-        # Exclude the last layers because they require a matching
-        # number of classes
-        model.load_weights(weights_path, by_name=True, exclude=[
-            "mrcnn_class_logits", "mrcnn_bbox_fc",
-            "mrcnn_bbox", "mrcnn_mask"])
-    else:
-        #model.load_weights(weights_path, by_name=True)
-        model.load_weights(weights_path, by_name=True, exclude=[
-            "mrcnn_class_logits", "mrcnn_bbox_fc",
-            "mrcnn_bbox", "mrcnn_mask"])
+    # Execute based on mode
+    if args.mode == 'train':
+        train(model, args.dataset, config)
+    elif args.mode == 'detect':
+        image = skimage.io.imread(args.image)
+        results = model.detect([image], verbose=1)
+        r = results[0]
+        splash = color_splash(image, r['masks'])
+        plt.imsave('splash_output.png', splash)
 
-    # Train or evaluate
-    if args.command == "train":
-        train(model)
-    elif args.command == "splash":
-        detect_and_color_splash(model, image_path=args.image,
-                                video_path=args.video)
-    else:
-        print("'{}' is not recognized. "
-              "Use 'train' or 'splash'".format(args.command))
+if __name__ == '__main__':
+    main()
