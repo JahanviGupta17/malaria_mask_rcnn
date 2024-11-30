@@ -25,11 +25,12 @@ except ImportError:
     sys.exit(1)
 
 # Configuration for Google Colab
-# Ensure you have the right GPU setup
 physical_devices = tf.config.list_physical_devices('GPU')
 if physical_devices:
-    tf.config.experimental.set_memory_growth(physical_devices[0], True)
-
+    try:
+        tf.config.experimental.set_memory_growth(physical_devices[0], True)
+    except:
+        print("Error configuring GPU memory growth.")
 # Validate TensorFlow version
 assert tf.__version__.startswith('2'), "TensorFlow 2.x is required"
 
